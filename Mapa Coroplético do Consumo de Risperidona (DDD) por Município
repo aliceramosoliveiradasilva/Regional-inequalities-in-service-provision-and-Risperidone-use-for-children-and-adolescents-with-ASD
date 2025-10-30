@@ -1,0 +1,167 @@
+################################################################################
+# TÍTULO: Mapa Coroplético do Consumo de Risperidona (DDD) por Município
+# AUTOR(A): Alice Ramos
+# DATA: 30 de outubro de 2025
+#
+# DESCRIÇÃO:
+# Este script carrega dados de DDD por município e um shapefile dos
+# municípios do Brasil. Ele junta os dados, calcula os quartis globais
+# de DDD e gera um mapa coroplético (faceted) por ano.
+#
+################################################################################
+
+
+# === 0. CONFIGURAÇÃO INICIAL ===
+
+# --- 0.1 Limpeza do Ambiente ---
+rm(list = ls()) # Limpa todas as variáveis
+cat("\014")     # Limpa o console
+gc()            # Libera memória
+
+# --- 0.2 Carregamento de Pacotes ---
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  dplyr,    # Manipulação de dados
+  sf,       # Manipulação de dados espaciais (shapefiles)
+  ggplot2,  # Visualização de dados
+  scales    # Funções de escala para ggplot (ex: `rescale`)
+)
+
+# --- 0.3 Diretório de Trabalho ---
+# (!!) RECOMENDAÇÃO PARA O GITHUB (!!)
+# Evite setwd() em scripts compartilháveis. Use "RStudio Projects" (.Rproj)
+# e caminhos relativos.
+#
+# setwd("/run/media/ramoscypriano/KINGSTON") # <--- Comentado
+# caminho <- "/home/ufrj/R"                   # <--- Comentado
+#
+# Estrutura de pastas sugerida (relativa ao .Rproj):
+# /meu_projeto.Rproj
+# /meu_script.R
+# /dados/ddd por municipio.csv
+# /dados/geografia/BR_Municipios_2024.shp (e arquivos .dbf, .shx etc.)
+
+
+# === 1. CARGA DOS DADOS ===
+
+# --- 1.1 Dados de Consumo (DDD) ---
+# Assumindo que o arquivo está na subpasta "dados"
+dados <- read.csv("dados/ddd por municipio.csv")
+
+# --- 1.2 Dados Espaciais (Shapefile) ---
+# Caminho para o shapefile (arquivo .shp)
+mapa_path <- "dados/geografia/BR_Municipios_2024.shp"
+mapa <- st_read(mapa_path)
+
+
+# === 2. PREPARAÇÃO E JUNÇÃO DOS DADOS ===
+
+# --- 2.1 Preparação da Chave (Mapa) ---
+# Cria a chave de junção (6 dígitos do Cód. IBGE) no shapefile
+mapa <- mapa %>%
+  mutate(AP_MUNPCN = substr(CD_MUN, 1, 6))
+
+# --- 2.2 Preparação da Chave (Dados) ---
+# Garante que a chave nos dados de DDD seja do tipo "character"
+dados$AP_MUNPCN <- as.character(dados$AP_MUNPCN)
+
+# --- 2.3 Junção (Join) ---
+# Junta os dados de DDD ao mapa.
+# Usamos left_join para manter todos os municípios do mapa,
+# mesmo que não tenham dados de DDD (eles aparecerão em cinza).
+dados_mapa <- mapa %>%
+  left_join(dados, by = "AP_MUNPCN") %>%
+  st_as_sf() # Garante que o objeto final ainda é um objeto 'sf'
+
+# --- 2.4 Validação da Geometria ---
+# Corrige eventuais problemas de geometria (ex: polígonos sobrepostos)
+# que podem causar erros na plotagem.
+dados_mapa <- st_make_valid(dados_mapa)
+
+
+# === 3. CÁLCULO DE QUARTIS ===
+
+# --- 3.1 Limpeza da Variável ---
+# Converte a coluna de DDD para numérica, tratando NAs
+dm <- dados_mapa %>%
+  mutate(
+    ddd = as.numeric(ddd_por_paciente_dia)
+  )
+
+# --- 3.2 Cálculo dos Quartis Globais ---
+# Calcula os quartis com base em TODOS os anos.
+# Isso é crucial para que as cores sejam comparáveis entre os facets (anos).
+qs <- quantile(dm$ddd, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = TRUE)
+
+# --- 3.3 Fallback para Quartis Idênticos ---
+# Se houver muitos zeros, os quartis podem ser idênticos (ex: 0, 0, 0, 10).
+# `cut()` falha com breaks duplicados. Este fallback cria 4 breaks lineares.
+if (length(unique(qs)) < 5) {
+  rng <- range(dm$ddd, na.rm = TRUE)
+  qs <- seq(rng[1], rng[2], length.out = 5)
+}
+
+# --- 3.4 Discretização (Criação das Faixas) ---
+# Corta a variável 'ddd' contínua em 4 faixas (quartis)
+dm <- dm %>%
+  mutate(
+    ddd_quartile = cut(
+      ddd,
+      breaks = qs,
+      include.lowest = TRUE, # Inclui o valor mais baixo
+      labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    )
+  )
+
+
+# === 4. VISUALIZAÇÃO (MAPA COROPLÉTICO) ===
+
+p <- ggplot(dm) +
+  # Mapeia a variável 'ddd_quartile' para a cor de preenchimento (fill)
+  # color = NA remove as bordas dos municípios, melhorando a performance
+  geom_sf(aes(fill = ddd_quartile), color = NA) +
+  
+  # Cria um painel (facet) para cada ano
+  facet_wrap(~ ano, ncol = 4) +
+  
+  # Define a paleta de cores (YlOrRd = Yellow-Orange-Red)
+  # na.value define a cor para municípios sem dados (NA)
+  scale_fill_brewer(
+    palette = "YlOrRd",
+    na.value = "grey55"
+  ) +
+  
+  labs(
+    fill = "DDD per Patient/Day (Quartiles)", # Título da legenda
+    caption = "Grey = no data."
+  ) +
+  
+  # Remove todos os elementos do tema (eixos, fundo, etc.)
+  theme_void() +
+  
+  # Adiciona customizações finais ao tema
+  theme(
+    strip.text = element_text(face = "bold", size = 12), # Título do facet (Ano)
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "bottom", # Posição da legenda
+    legend.box = "vertical",
+    legend.title = element_text(face = "bold")
+  )
+
+
+# === 5. EXPORTAÇÃO ===
+
+# --- 5.1 Visualizar o Gráfico ---
+# Mostra o gráfico no painel "Plots" do RStudio
+print(p)
+
+# --- 5.2 Salvar o Gráfico ---
+# Salva o gráfico 'p' em um arquivo PNG
+ggsave("maps_ddd_per_patient_day_by_year.png", 
+       plot = p, 
+       width = 14, 
+       height = 10, 
+       dpi = 300,
+       bg = "white") # Adiciona um fundo branco
+
+# === FIM DO SCRIPT ===
