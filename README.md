@@ -1,7 +1,7 @@
 # Regional-inequalities-in-service-provision-and-Risperidone-use-for-children-and-adolescents-with-ASD
 ################################################################################
 # TÍTULO: Análise de Tendência do Consumo de Risperidona (DDD) no Brasil
-# AUTOR(A): Alice Ramos (adaptado por Gemini)
+# AUTOR(A): Alice Ramos
 # DATA: 30 de outubro de 2025
 #
 # DESCRIÇÃO:
