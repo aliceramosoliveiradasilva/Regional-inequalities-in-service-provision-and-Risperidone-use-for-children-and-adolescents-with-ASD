@@ -1,0 +1,336 @@
+################################################################################
+# TÍTULO: Análise de Autocorrelação Espacial (Moran Global e LISA)
+#         Prevalência de TEA no Brasil (2014-2023)
+#
+# AUTOR(A):  Alice Ramos)
+# DATA:     31 de outubro de 2025
+#
+# DESCRIÇÃO: Este script realiza a análise de autocorrelação espacial da
+#            prevalência de TEA (por 100.000 hab.) nos municípios brasileiros.
+#            1. Calcula o I de Moran Global (mede o clustering geral)
+#            2. Calcula o LISA (Local Moran) (identifica os clusters HH, LL)
+#
+# DADOS DE ENTRADA:
+#   - "BR_Municipios_2024.shp": Shapefile dos municípios do Brasil.
+#   - "dados_prevalencia_com_ibge7.csv": CSV com n_pacientes, populacao,
+#                                        cod_mun_ibge_7dig, ano.
+#
+# DADOS DE SAÍDA (na pasta ./saidas/):
+#   - "global_moran_resultados_por_ano.csv": Tabela S2 (Moran's I e p-valor)
+#   - "top200_municipios_por_cluster_ano.csv": Tabela S3 (Municípios em clusters)
+#   - "lisa_centroides.gpkg": Camada para GIS (QGIS/ArcGIS) com resultados
+#   - "mapa_lisa_clusters_por_ano_revisado.pdf": Figura (mapas em painel)
+#   - "barras_clusters_por_ano_sem_NA.pdf": Figura (barras empilhadas)
+#
+################################################################################
+
+
+# --- 0. PREPARAÇÃO E PACOTES ---
+
+# Limpa o ambiente
+rm(list = ls())
+
+# Instale os pacotes necessários (se for a primeira vez)
+# install.packages(c("sf", "spdep", "dplyr", "tidyr", "ggplot2", "readr", "stringr", "forcats"))
+
+# Carregar bibliotecas
+library(sf)
+library(spdep)       # Para Moran e LISA
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(forcats)     # Para reordenar fatores no ggplot
+
+
+# --- 1. CONFIGURAÇÃO (DEFINIR DIRETÓRIOS E PASTAS) ---
+
+# Defina o diretório de trabalho principal (ONDE ESTÃO SEUS DADOS)
+# !! ÚNICA LINHA QUE VOCÊ PRECISA ALTERAR !!
+BASE_DIR <- "/home/ufrj/R/DDD risperidona"
+setwd(BASE_DIR)
+
+# Define e cria a pasta de saída (onde os resultados serão salvos)
+OUTPUT_DIR <- file.path(BASE_DIR, "saidas")
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR)
+  cat(paste("Pasta de saída criada em:", OUTPUT_DIR, "\n"))
+}
+
+
+# --- 2. CARGA E PREPARO DE DADOS ---
+
+cat("ETAPA 2: Lendo shapefile e dados de prevalência...\n")
+
+# 2.1 Ler o shapefile dos municípios
+tryCatch({
+  mapa_sf_raw <- st_read("BR_Municipios_2024.shp", quiet = TRUE)
+}, error = function(e) {
+  stop("Erro ao ler 'BR_Municipios_2024.shp'. Verifique o caminho.")
+})
+
+# 2.2 Calcular Centroides
+# Usamos centroides (ponto único) para cada município.
+# Isso simplifica o cálculo da vizinhança (k-NN) e garante 1 ponto por município.
+cat("Calculando centroides únicos (1 linha por município)...\n")
+mapa_br_base <- mapa_sf_raw %>%
+  select(CD_MUN, NM_MUN, SIGLA_UF, geometry) %>%
+  st_make_valid() %>%
+  st_centroid() # Cria um ponto único (X,Y)
+
+cat(paste("Total de", nrow(mapa_br_base), "municípios (centroides) carregados.\n"))
+
+# 2.3 Ler e preparar os dados de prevalência
+dados_prevalencia <- read_csv("dados_prevalencia_com_ibge7.csv") %>%
+  select(cod_mun_ibge_7dig, ano, n_pacientes_unicos, populacao) %>%
+  mutate(cod_mun_ibge_7dig = as.character(cod_mun_ibge_7dig))
+
+# 2.4 Calcular a prevalência por 100.000 habitantes
+# Lida com divisão por zero (Inf) ou 0/0 (NaN), substituindo por NA.
+dados_prevalencia <- dados_prevalencia %>%
+  mutate(prevalencia = (n_pacientes_unicos / populacao) * 100000) %>%
+  mutate(prevalencia = if_else(is.infinite(prevalencia) | is.nan(prevalencia),
+                             NA_real_,
+                             prevalencia))
+
+
+# --- 3. CRIAÇÃO DA MATRIZ DE VIZINHANÇA (k-NN) ---
+
+cat("ETAPA 3: Criando a matriz de vizinhança (k-nearest neighbors)...\n")
+
+# 3.1 Extrair coordenadas 2D (X e Y) dos centroides
+coords_2d <- st_coordinates(mapa_br_base)
+
+# 3.2 Criar a lista de vizinhos (k-nearest neighbors, k=6)
+# Usamos k=6 (seis vizinhos mais próximos) como uma escolha padrão.
+vizinhos_nb <- knearneigh(coords_2d, k = 6) %>% knn2nb()
+
+# 3.3 Criar a lista de pesos espaciais (estilo "W" = normalizado pela soma)
+# zero.policy=TRUE permite municípios sem vizinhos (ilhas), embora k-NN evite isso.
+vizinhos_listw <- nb2listw(vizinhos_nb, style = "W", zero.policy = TRUE)
+
+cat("Matriz de vizinhança (k=6) criada com sucesso!\n")
+
+
+# --- 4. ANÁLISE ESPACIAL (LOOP POR ANO) ---
+
+cat("ETAPA 4: Rodando Moran (Global) e LISA (Local) para cada ano...\n")
+
+# 4.1 Preparar grid completo de dados (Município-Ano)
+municipios_base <- st_drop_geometry(mapa_br_base) %>%
+  select(CD_MUN, NM_MUN, SIGLA_UF)
+
+anos_range <- unique(dados_prevalencia$ano)
+
+dados_completos <- expand_grid(CD_MUN = municipios_base$CD_MUN, ano = anos_range) %>%
+  left_join(municipios_base, by = "CD_MUN") %>%
+  left_join(dados_prevalencia, by = c("CD_MUN" = "cod_mun_ibge_7dig", "ano" = "ano"))
+
+# 4.2 Loop de análise (Moran e LISA)
+lista_resultados_lisa <- list()
+lista_resultados_global <- list()
+
+for (ano_i in anos_range) {
+  cat(paste("... processando ano", ano_i, "\n"))
+
+  # 4.2.1 Alinhar dados ao shapefile
+  # CRÍTICO: Garante que a ordem dos dados (prev_vec) seja a mesma
+  # da matriz de vizinhança (vizinhos_listw).
+  dados_ano_i <- dados_completos %>%
+    filter(ano == ano_i) %>%
+    arrange(match(CD_MUN, mapa_br_base$CD_MUN))
+
+  prev_vec <- dados_ano_i$prevalencia
+
+  # 4.2.2 Lidar com valores Ausentes (NA)
+  # A análise espacial não roda com NAs. Criamos um subconjunto
+  # apenas com os municípios com dados válidos (finitos) para aquele ano.
+  idx_valid <- is.finite(prev_vec)
+
+  # Pula o ano se houver poucos dados
+  if (sum(idx_valid) < 5) {
+    warning(sprintf("Ano %s com poucos valores; pulando Moran/LISA.", ano_i))
+    next
+  }
+
+  # Subconjunto da matriz de vizinhança APENAS para os válidos
+  nb_sub <- subset.nb(vizinhos_nb, subset = idx_valid)
+  lw_sub <- nb2listw(nb_sub, style = "W", zero.policy = TRUE)
+
+  # 4.2.3 Moran Global
+  moran_res <- moran.test(prev_vec[idx_valid], lw_sub, zero.policy = TRUE)
+  lista_resultados_global[[as.character(ano_i)]] <- data.frame(
+    ano = ano_i,
+    moran_i = unname(moran_res$estimate[1]),
+    p_value = moran_res$p.value
+  )
+
+  # 4.2.4 LISA (Local Moran)
+  # Padroniza a prevalência (Z-score)
+  prev_scaled_valid <- scale(prev_vec[idx_valid]) %>% as.vector()
+  # Calcula a defasagem espacial (média dos vizinhos) do Z-score
+  spat_lag_valid <- lag.listw(lw_sub, prev_scaled_valid, zero.policy = TRUE)
+  # Roda o LISA (nos dados originais) para obter os p-valores
+  lisa_mat_valid <- localmoran(prev_vec[idx_valid], lw_sub, zero.policy = TRUE)
+
+  p_local_valid <- lisa_mat_valid[, 5] # p-value está na 5ª coluna
+
+  # 4.2.5 Classificar Quadrantes (HH, LL, HL, LH)
+  quad_valid <- case_when(
+    prev_scaled_valid > 0 & spat_lag_valid > 0 ~ "High-High",
+    prev_scaled_valid < 0 & spat_lag_valid < 0 ~ "Low-Low",
+    prev_scaled_valid > 0 & spat_lag_valid < 0 ~ "High-Low",
+    prev_scaled_valid < 0 & spat_lag_valid > 0 ~ "Low-High",
+    TRUE ~ "Não Significante"
+  )
+  
+  # O cluster só é válido se p < 0.05
+  cluster_valid <- ifelse(
+    p_local_valid < 0.05, quad_valid, "Não Significante"
+  )
+
+  # 4.2.6 Reconstituir o vetor completo (N=5570)
+  # Preenche NAs onde a análise não rodou.
+  n <- length(prev_vec)
+  lisa_p_full <- rep(NA_real_, n)
+  quadrante_full <- rep(NA_character_, n)
+  cluster_full <- rep(NA_character_, n)
+
+  lisa_p_full[idx_valid] <- p_local_valid
+  quadrante_full[idx_valid] <- quad_valid
+  cluster_full[idx_valid] <- cluster_valid
+
+  # 4.2.7 Salvar resultados do ano
+  lista_resultados_lisa[[as.character(ano_i)]] <- dados_ano_i %>%
+    mutate(
+      lisa_p_value = lisa_p_full,
+      quadrante_lisa = quadrante_full,
+      lisa_cluster = factor(cluster_full,
+                            levels = c("High-High", "Low-Low", "High-Low", "Low-High", "Não Significante"))
+    )
+} # Fim do loop for()
+
+# 4.3 Combinar todos os anos em dataframes únicos
+lisa_resultados_completos <- bind_rows(lista_resultados_lisa)
+global_moran_resultados <- bind_rows(lista_resultados_global)
+
+cat("ETAPA 4 concluída. Análises de Moran e LISA finalizadas.\n")
+
+
+# --- 5. EXPORTAR RESULTADOS (Tabelas, Mapas, Gráficos) ---
+
+cat("ETAPA 5: Exportando todos os resultados para a pasta /saidas/ ...\n")
+
+# 5.1 Tabela: Moran Global (Tabela S2)
+write_csv2(global_moran_resultados,
+           file.path(OUTPUT_DIR, "global_moran_resultados_por_ano.csv"))
+
+# 5.2 Tabela: Top 200 municípios por cluster HH e LL (Tabela S3)
+top200_por_cluster_ano <- lisa_resultados_completos %>%
+  filter(lisa_cluster %in% c("High-High", "Low-Low")) %>%
+  group_by(ano, lisa_cluster) %>%
+  slice_max(order_by = prevalencia, n = 100, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(ano, lisa_cluster, desc(prevalencia)) %>%
+  select(ano, lisa_cluster, SIGLA_UF, CD_MUN, NM_MUN, prevalencia, lisa_p_value)
+
+write_csv2(top200_por_cluster_ano,
+           file.path(OUTPUT_DIR, "top200_municipios_por_cluster_ano.csv"))
+
+# 5.3 Tabela: Contagem de clusters por ano (para gráfico)
+contagem_ano_cluster <- lisa_resultados_completos %>%
+  filter(!is.na(lisa_cluster)) %>% # Remove NAs (municípios sem dados)
+  count(ano, lisa_cluster, name = "n") %>%
+  tidyr::complete(ano, lisa_cluster, fill = list(n = 0))
+
+write_csv2(contagem_ano_cluster,
+           file.path(OUTPUT_DIR, "contagem_clusters_por_ano.csv"))
+
+# 5.4 Tabela: Contagem de HH/LL por UF e Ano (para heatmap)
+hh_ll_uf_ano <- lisa_resultados_completos %>%
+  filter(lisa_cluster %in% c("High-High", "Low-Low")) %>%
+  count(SIGLA_UF, ano, lisa_cluster, name = "n")
+
+write_csv2(hh_ll_uf_ano,
+           file.path(OUTPUT_DIR, "contagem_hh_ll_por_uf_ano.csv"))
+
+# 5.5 Camada Geográfica: Exportar Centroides + LISA (para QGIS)
+mapa_final_lisa <- mapa_br_base %>%
+  left_join(lisa_resultados_completos, by = "CD_MUN")
+
+st_write(mapa_final_lisa,
+         file.path(OUTPUT_DIR, "lisa_centroides.gpkg"),
+         layer = "lisa_centroides", delete_dsn = TRUE)
+
+
+# --- 6. GERAR E SALVAR GRÁFICOS ---
+
+cat("ETAPA 6: Gerando e salvando gráficos (PNG e PDF)...\n")
+
+# 6.1 Paleta de cores padrão LISA
+cores_lisa_mapas <- c(
+  "High-High" = "#D7191C",        # Vermelho
+  "Low-Low" = "#2C7BB6",          # Azul
+  "High-Low" = "#FDAE61",         # Laranja
+  "Low-High" = "#ABD9E9",         # Azul Claro
+  "Não Significante" = "#8E8E8E", # Cinza escuro
+  "NA" = "#E5E5E9"               # Cinza claro para NA
+)
+
+# 6.2 Gráfico: Barras Empilhadas (Evolução dos clusters)
+g_barras_sem_na <- ggplot(contagem_ano_cluster,
+                          aes(x = factor(ano), y = n, fill = lisa_cluster)) +
+  geom_col() +
+  scale_fill_manual(values = cores_lisa_mapas,
+                    drop = FALSE,
+                    name = "Cluster LISA (p < 0.05)") +
+  labs(x = "Ano", y = "Nº de municípios") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(OUTPUT_DIR, "barras_clusters_por_ano_sem_NA.png"),
+       g_barras_sem_na, width = 10, height = 6, dpi = 300)
+ggsave(file.path(OUTPUT_DIR, "barras_clusters_por_ano_sem_NA.pdf"),
+       g_barras_sem_na, width = 10, height = 6)
+
+
+# 6.3 Gráfico: Mapas em Painel (Grid por Ano)
+mapa_lisa_grid_pdf <- ggplot(mapa_final_lisa) +
+  geom_sf(aes(color = lisa_cluster), size = 0.12, show.legend = TRUE) +
+  facet_wrap(~ ano, ncol = 4) +
+  scale_color_manual(
+    name = "Cluster LISA (p < 0.05)",
+    values = cores_lisa_mapas,
+    drop = FALSE,
+    na.value = "#E5E5E9",  # Cor para NAs (municípios sem dados)
+    guide = guide_legend(override.aes = list(size = 4)) # Legenda maior
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 12, face = "bold")
+  )
+
+ggsave(file.path(OUTPUT_DIR, "mapa_lisa_clusters_por_ano_revisado.png"),
+       mapa_lisa_grid_pdf, width = 16, height = 12, dpi = 300)
+ggsave(file.path(OUTPUT_DIR, "mapa_lisa_clusters_por_ano_revisado.pdf"),
+       mapa_lisa_grid_pdf, width = 16, height = 12)
+
+# 6.4 Gráfico: Heatmap (HH/LL por UF e Ano)
+g_heat <- ggplot(hh_ll_uf_ano,
+                 aes(x = factor(ano), y = fct_rev(SIGLA_UF), fill = n)) +
+  geom_tile() +
+  facet_wrap(~ lisa_cluster, ncol = 1) +
+  scale_fill_gradient(low = "#F0F4FF", high = "#1F4E79") +
+  labs(x = "Ano", y = "UF", fill = "Municípios") +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(OUTPUT_DIR, "heatmap_hh_ll_por_uf_ano.png"),
+       g_heat, width = 8, height = 10, dpi = 300)
+ggsave(file.path(OUTPUT_DIR, "heatmap_hh_ll_por_uf_ano.pdf"),
+       g_heat, width = 8, height = 10)
+
+
+cat("\n--- SCRIPT FINALIZADO --- \n")
+cat(paste("Todos os resultados foram salvos em:", OUTPUT_DIR, "\n"))
